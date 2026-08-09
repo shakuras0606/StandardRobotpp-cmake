@@ -1,0 +1,28 @@
+# Normalize source and configuration text in the repository.
+* text=auto eol=lf
+
+*.c       text
+*.h       text
+*.cpp     text
+*.hpp     text
+*.s       text
+*.S       text
+*.ld      text
+*.cmake   text
+CMakeLists.txt text
+*.json    text
+*.md      text
+*.yml     text
+*.yaml    text
+*.py      text
+*.bat     text eol=crlf
+
+# Prebuilt libraries and media must never receive line-ending conversion.
+*.a       binary
+*.lib     binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.ico     binary
+*.pdf     binary
