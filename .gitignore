@@ -68,3 +68,17 @@ Desktop.ini
 
 # Local telemetry exports
 vofa*.csv
+
+# Local analysis scripts; keep the build prerequisite checker
+*.py
+!/check_build_env.py
+
+# Test workspaces and Python cache files
+test/
+tests/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Local analysis output
+/analysis/
