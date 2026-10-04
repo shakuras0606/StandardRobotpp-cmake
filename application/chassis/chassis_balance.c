@@ -21,7 +21,7 @@
     3.在浮空时通过动量守恒维持底盘的平衡，并调整合适的触地姿态
 
   ****************************(C) COPYRIGHT 2024 Polarbear****************************
-  
+  test
 */
 #include "chassis_balance.h" 
 #if (CHASSIS_TYPE == CHASSIS_BALANCE)
