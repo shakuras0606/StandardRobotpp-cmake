@@ -1,4 +1,10 @@
 #include "bsp_can.h"
+#include "bsp_delay.h"
+
+uint32_t CAN_TX_FAIL_COUNT = 0;
+
+#define CAN_TX_RETRY_TIMES    8U
+#define CAN_TX_RETRY_DELAY_US 50U
 
 void can_filter_init(void)
 {
@@ -25,21 +31,35 @@ void can_filter_init(void)
 
 /**
  * @brief          发送控制数据
- * @param[in]      can_handle 选择CAN1或CAN2
- * @param[in]      tx_header  CAN发送数据header
- * @param[in]      tx_data    发送数据
- * @return         none
+ * @param[in]      can_ctrl_data 待发送的数据
+ * @return         HAL_OK: 已写入发送邮箱, 本帧会由硬件发送;
+ *                 其他: 等待超时或总线异常, 本帧被丢弃
+ * @note           邮箱满时每 50us 重试一次, 最多 8 次(Bus-Off 立即放弃),
+ *                 丢弃的帧计数在 CAN_TX_FAIL_COUNT，便于调试观察。
  */
-void CAN_SendTxMessage(CanCtrlData_s * can_ctrl_data)
+HAL_StatusTypeDef CAN_SendTxMessage(CanCtrlData_s * can_ctrl_data)
 {
-    uint32_t send_mail_box;
-    uint8_t cnt = 20;  // 重复检测次数
-
-    uint32_t free_TxMailbox =
-        HAL_CAN_GetTxMailboxesFreeLevel(can_ctrl_data->hcan);  // 检测是否有空闲邮箱
-    while (free_TxMailbox < 3 && cnt--) {                      // 等待空闲邮箱数达到3
-        free_TxMailbox = HAL_CAN_GetTxMailboxesFreeLevel(can_ctrl_data->hcan);
+    if (can_ctrl_data == NULL || can_ctrl_data->hcan == NULL) {
+        CAN_TX_FAIL_COUNT++;
+        return HAL_ERROR;
     }
-    HAL_CAN_AddTxMessage(
+
+    uint32_t send_mail_box = 0;
+    HAL_StatusTypeDef status = HAL_CAN_AddTxMessage(
         can_ctrl_data->hcan, &can_ctrl_data->tx_header, can_ctrl_data->tx_data, &send_mail_box);
+
+    for (uint8_t retry = 0; status != HAL_OK && retry < CAN_TX_RETRY_TIMES; retry++) {
+        if ((can_ctrl_data->hcan->Instance->ESR & CAN_ESR_BOFF) != 0U) {
+            break;
+        }
+        delay_us(CAN_TX_RETRY_DELAY_US);
+        status = HAL_CAN_AddTxMessage(
+            can_ctrl_data->hcan, &can_ctrl_data->tx_header, can_ctrl_data->tx_data, &send_mail_box);
+    }
+
+    if (status != HAL_OK) {
+        CAN_TX_FAIL_COUNT++;
+    }
+
+    return status;
 }

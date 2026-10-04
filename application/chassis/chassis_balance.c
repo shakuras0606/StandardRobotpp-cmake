@@ -37,6 +37,8 @@
 #include "gimbal.h"
 #include "kalman_filter.h"
 #include "macro_typedef.h"
+#include "pos_debug_reference.h"
+#include "pos_debug_roll.h"
 #include "music_task.h"
 #include "signal_generator.h"
 #include "stdbool.h"
@@ -136,6 +138,9 @@ typedef struct {
 static ZeroCalibrate_s ZERO_CALIBRATE = {
     .state = ZERO_CALIBRATE_IDLE,
 };
+
+static float pos_debug_leg_length_target = POS_DEBUG_LEG_LENGTH_MID_REF;
+static PosDebugRollPid_s pos_debug_roll_pid = {0};
 
 Chassis_s CHASSIS = {
     .mode = CHASSIS_OFF,
@@ -242,7 +247,7 @@ void ChassisInit(void)
         MAX_OUT_CHASSIS_LEG_LENGTH_LENGTH, MAX_IOUT_CHASSIS_LEG_LENGTH_LENGTH);
     CHASSIS.pid.leg_length_length[1].N = N_LEG_LENGTH_LENGTH;
 
-    // POS_DEBUG 专用腿长力环。PID 输出为沿杆方向的虚拟力，不包含重力前馈。
+    // POS_DEBUG 专用腿长力环。PID 输出沿杆方向补偿力，最终再叠加重力前馈。
     float pos_debug_leg_length_force_pid[3] = {
         KP_POS_DEBUG_LEG_LENGTH_FORCE, KI_POS_DEBUG_LEG_LENGTH_FORCE,
         KD_POS_DEBUG_LEG_LENGTH_FORCE};
@@ -530,14 +535,16 @@ void ChassisSetMode(void)
     }
 #endif
 
-static uint8_t state_flag = 0;
+    static uint8_t state_flag = 0;
+    PosDebugSwitchCommand_s switch_command = PosDebugSelectSwitchCommand(
+        switch_is_up(CHASSIS.rc->rc.s[CHASSIS_MODE_CHANNEL]),
+        switch_is_mid(CHASSIS.rc->rc.s[CHASSIS_MODE_CHANNEL]),
+        POS_DEBUG_LEG_LENGTH_MID_REF, POS_DEBUG_LEG_LENGTH_UP_REF);
 
-    if (switch_is_up(CHASSIS.rc->rc.s[CHASSIS_MODE_CHANNEL])) {
-        // CHASSIS.mode = CHASSIS_FREE;
-        state_flag =1;
-        CHASSIS.mode = CHASSIS_SAFE;
-    } else if (switch_is_mid(CHASSIS.rc->rc.s[CHASSIS_MODE_CHANNEL])) {
-        if(state_flag == 1) 
+    if (switch_command.powered) {
+        pos_debug_leg_length_target = switch_command.leg_length_target;
+
+        if(state_flag == 1)
         {
             /* 必须清零来源的车体本体位置估计，否则会被观测器覆盖回去 */
             CHASSIS.fdb.body.x = 0;
@@ -553,7 +560,7 @@ static uint8_t state_flag = 0;
  
         CHASSIS.mode = CHASSIS_POS_DEBUG;
         //CHASSIS.mode = CHASSIS_CUSTOM;
-    } else if (switch_is_down(CHASSIS.rc->rc.s[CHASSIS_MODE_CHANNEL])) {
+    } else {
         state_flag =1;
         CHASSIS.mode = CHASSIS_SAFE;
     }
@@ -622,14 +629,17 @@ static void UpdateMotorStatus(void)
 static void UpdateBodyStatus(void)
 {
     // 更新陀螺仪反馈数据
-    CHASSIS.fdb.body.roll = GetImuAngle(AX_YAW);
-    CHASSIS.fdb.body.roll_dot = GetImuVelocity(AX_YAW);
+    // 欧拉角数组为 [yaw,pitch,roll]；近直立时 Roll 角速度对应陀螺仪 X 轴。
+    CHASSIS.fdb.body.roll = GetImuAngle(INS_ROLL_ADDRESS_OFFSET);
+    CHASSIS.fdb.body.roll_dot = GetImuVelocity(AX_X);
 
     CHASSIS.fdb.body.pitch = GetImuAngle(AX_PITCH);
     CHASSIS.fdb.body.pitch_dot = GetImuVelocity(AX_PITCH);
 
-    CHASSIS.fdb.body.yaw = GetImuAngle(AX_ROLL);
-    CHASSIS.fdb.body.yaw_dot = GetImuVelocity(AX_ROLL);
+    // 欧拉角数组为 [yaw,pitch,roll]，陀螺仪数组为 [x,y,z]，不能共用下标。
+    CHASSIS.fdb.body.yaw = GetImuAngle(INS_YAW_ADDRESS_OFFSET);
+    // 水平转动实测：当前 Yaw 角度变化率与 Z 轴陀螺仪反号，近直立时 yaw_dot = -gyro_z。
+    CHASSIS.fdb.body.yaw_dot = -GetImuVelocity(AX_Z);
 
     LowPassFilterCalc(&CHASSIS.lpf.roll, CHASSIS.fdb.body.roll);
 
@@ -743,7 +753,8 @@ static void UpdateLegStatus(void)
             dL0_dPhi0);
         CHASSIS.fdb.leg[i].rod.dL0 = dL0_dPhi0[0];
         CHASSIS.fdb.leg[i].rod.dPhi0 = dL0_dPhi0[1];
-        CHASSIS.fdb.leg[i].rod.dTheta = -CHASSIS.fdb.leg[i].rod.dPhi0 - CHASSIS.fdb.body.phi_dot;
+        // rod.Theta = PI/2 - Phi0 + leg_state.phi；后者的正确角速度为 body.phi_dot。
+        CHASSIS.fdb.leg[i].rod.dTheta = -CHASSIS.fdb.leg[i].rod.dPhi0 + CHASSIS.fdb.body.phi_dot;
 
         // 更新加速度信息
         float accel = (CHASSIS.fdb.leg[i].rod.dL0 - last_dL0) / (CHASSIS.duration * MS_TO_S);
@@ -875,25 +886,18 @@ static void BodyMotionObserve(void)
     CHASSIS.fdb.body.x_dot_obv = OBSERVER.body.v_kf.xhat_data[0];
     CHASSIS.fdb.body.x_acc_obv = OBSERVER.body.v_kf.xhat_data[1];
 
-    // 速度死区：静止时抑制 IMU 偏置导致的 INS 漂移 (≈0.05 m/s)
-    // 当无移动指令且估计速度低于死区时，将速度钳位为 0，阻断 x 自增
-    if (fabs(CHASSIS.ref.speed_vector.vx) < WHEEL_DEADZONE &&
-        fabs(CHASSIS.fdb.body.x_dot_obv) < VELOCITY_DEAD_ZONE) {
-        CHASSIS.fdb.body.x_dot_obv = 0.0f;
-    }
-
-    if (fabs(CHASSIS.ref.speed_vector.vx) < WHEEL_DEADZONE) {
-        CHASSIS.fdb.body.x += CHASSIS.fdb.body.x_dot_obv * CHASSIS.duration * MS_TO_S;
-    } else {
-        //CHASSIS.fdb.body.x = 0.0f;
-    }
+    // 全状态 LQR 需要连续的位置反馈。位置反馈与目标位置都不做固定距离钳位，
+    // 否则连续行驶越过边界后，x 误差会失真并让速度指令提前失效。
+    CHASSIS.fdb.body.x +=
+        CHASSIS.fdb.body.x_dot_obv * CHASSIS.duration * MS_TO_S;
 
     // 更新2条腿的状态向量
     uint8_t i = 0;
     for (i = 0; i < 2; i++) {
         // clang-format off
         CHASSIS.fdb.leg_state[i].theta     = -(M_PI_2 - CHASSIS.fdb.leg[i].rod.Phi0 - CHASSIS.fdb.body.phi);
-        CHASSIS.fdb.leg_state[i].theta_dot = -(-CHASSIS.fdb.leg[i].rod.dPhi0 - CHASSIS.fdb.body.phi_dot);
+        // theta = Phi0 - leg_state.phi - PI/2，故 theta_dot = dPhi0 - phi_dot。
+        CHASSIS.fdb.leg_state[i].theta_dot = CHASSIS.fdb.leg[i].rod.dPhi0 - CHASSIS.fdb.body.phi_dot;
         CHASSIS.fdb.leg_state[i].x         = -CHASSIS.fdb.body.x;
         CHASSIS.fdb.leg_state[i].x_dot     = -CHASSIS.fdb.body.x_dot_obv;
         CHASSIS.fdb.leg_state[i].phi       = -CHASSIS.fdb.body.phi;
@@ -917,12 +921,14 @@ static void BodyMotionObserve(void)
 void ChassisReference(void)
 {
     int16_t rc_x = 0, rc_wz = 0;
-    int16_t rc_length = 0, rc_angle = 0;
+    int16_t rc_length = 0, rc_pos_debug_x = 0, rc_angle = 0;
     int16_t rc_roll = 0;
     rc_deadband_limit(CHASSIS.rc->rc.ch[CHASSIS_X_CHANNEL], rc_x, CHASSIS_RC_DEADLINE);
     rc_deadband_limit(CHASSIS.rc->rc.ch[CHASSIS_WZ_CHANNEL], rc_wz, CHASSIS_RC_DEADLINE);
     rc_deadband_limit(
-        CHASSIS.rc->rc.ch[POS_DEBUG_LENGTH_CHANNEL], rc_length, CHASSIS_RC_DEADLINE);
+        CHASSIS.rc->rc.ch[POS_DEBUG_X_CHANNEL], rc_pos_debug_x, CHASSIS_RC_DEADLINE);
+    // ch[1] 在 POS_DEBUG 中用于前后速度；其他模式继续沿用原来的腿长输入。
+    rc_length = rc_pos_debug_x;
     rc_deadband_limit(CHASSIS.rc->rc.ch[0], rc_angle, CHASSIS_RC_DEADLINE);
     rc_deadband_limit(CHASSIS.rc->rc.ch[CHASSIS_ROLL_CHANNEL], rc_roll, CHASSIS_RC_DEADLINE);
 
@@ -988,6 +994,9 @@ void ChassisReference(void)
     // 腿部控制
     static float angle = M_PI_2;
     static float length = 0.12f;
+    static float pos_debug_x_ref = 0.0f;
+    static float pos_debug_x_dot_ref = 0.0f;
+    static float pos_debug_yaw_ref = 0.0f;
     static ChassisMode_e last_mode = CHASSIS_OFF;
     switch (CHASSIS.mode) {
         case CHASSIS_STAND_UP: {
@@ -1013,16 +1022,80 @@ void ChassisReference(void)
             }
         } break;
         case CHASSIS_POS_DEBUG: {
-            // 摆角/机体 pitch 调试阶段固定腿长；首次进入时清除腿长 PID 历史量。
+            const float pos_debug_control_dt = CHASSIS.duration * MS_TO_S;
+
+            // 首次进入 POS_DEBUG：清除历史量，并从当前腿长平滑过渡到拨杆目标。
             if (last_mode != CHASSIS_POS_DEBUG) {
                 PID_clear(&CHASSIS.pid.pos_debug_leg_length_force[0]);
                 PID_clear(&CHASSIS.pid.pos_debug_leg_length_force[1]);
                 PID_clear(&CHASSIS.pid.wheel_stop[0]);
                 PID_clear(&CHASSIS.pid.wheel_stop[1]);
+
+                PID_clear(&CHASSIS.pid.yaw_angle);
+                PID_clear(&CHASSIS.pid.yaw_velocity);
+                PID_clear(&CHASSIS.pid.roll_angle);
+                PosDebugRollPidReset(&pos_debug_roll_pid);
+
+                length = 0.5f *
+                    (CHASSIS.fdb.leg[0].rod.L0 + CHASSIS.fdb.leg[1].rod.L0);
+                pos_debug_x_ref = CHASSIS.fdb.leg_state[0].x;
+                pos_debug_x_dot_ref = 0.0f;
+                pos_debug_yaw_ref = rad_format(CHASSIS.fdb.body.yaw);
+            }
+
+            // 中档目标 0.20 m、上档目标 0.35 m，切换时限制目标腿长变化速度。
+            length = PosDebugVelocityStep(
+                length, pos_debug_leg_length_target,
+                POS_DEBUG_LEG_LENGTH_RATE_MAX, pos_debug_control_dt);
+
+            /*
+             * rc.ch[1] 给出速度请求，经过加速度斜坡后再积分得到目标位移。
+             * 松杆时先平滑减速到 0，然后保持 x_ref；不限制累计行程。
+             */
+            const float pos_debug_x_dot_request =
+                POS_DEBUG_X_REF_DIRECTION *
+                fp32_constrain(rc_pos_debug_x * RC_TO_ONE, -1.0f, 1.0f) *
+                POS_DEBUG_X_REF_SPEED_MAX;
+
+            pos_debug_x_dot_ref = PosDebugVelocityStep(
+                pos_debug_x_dot_ref, pos_debug_x_dot_request,
+                POS_DEBUG_X_REF_ACCEL_MAX, pos_debug_control_dt);
+            pos_debug_x_ref += pos_debug_x_dot_ref * pos_debug_control_dt;
+
+            CHASSIS.ref.speed_vector.vx = pos_debug_x_dot_ref;
+            for (uint8_t i = 0; i < 2; i++) {
+                CHASSIS.ref.leg_state[i].x = pos_debug_x_ref;
+                CHASSIS.ref.leg_state[i].x_dot = pos_debug_x_dot_ref;
             }
 
             angle = M_PI_2;
-            length = POS_DEBUG_LEG_LENGTH_REF;
+
+        #if POS_DEBUG_YAW_ENABLE
+            // 保持当前工程的遥控器转向极性：
+            // rc_wz 左打为负，因此加负号后得到正的 yaw 指令。
+            float yaw_rc_rate =
+                -rc_wz * RC_TO_ONE * POS_DEBUG_YAW_REF_RATE_MAX;
+
+            // 内环单独调试时，该变量直接作为目标角速度。
+            CHASSIS.ref.speed_vector.wz = yaw_rc_rate;
+
+        #if POS_DEBUG_YAW_ANGLE_LOOP_ENABLE
+            // add 目标限制相对机体的超前量，不限制累计旋转圈数。
+            // 跟踪不及时不再积累到 ±PI，防止最短路径误差突然反号。
+            pos_debug_yaw_ref = PosDebugYawReferenceStep(
+                pos_debug_yaw_ref, CHASSIS.fdb.body.yaw,
+                yaw_rc_rate, pos_debug_control_dt, POS_DEBUG_YAW_REF_LEAD_MAX);
+        #else
+            // 只调角速度内环时，不积累目标角度。
+            pos_debug_yaw_ref = rad_format(CHASSIS.fdb.body.yaw);
+        #endif
+
+            CHASSIS.ref.body.yaw = pos_debug_yaw_ref;
+        #else
+            // 关闭 Yaw 后目标始终跟随当前位置，避免重新开启时发生跳变。
+            CHASSIS.ref.speed_vector.wz = 0.0f;
+            CHASSIS.ref.body.yaw = CHASSIS.fdb.body.yaw;
+        #endif
         } break;
         case CHASSIS_FREE: {
         } break;
@@ -1039,7 +1112,14 @@ void ChassisReference(void)
     CHASSIS.ref.rod_Angle[0] = angle;
     CHASSIS.ref.rod_Angle[1] = angle;
 
-    CHASSIS.ref.body.roll = fp32_constrain(-rc_roll * RC_TO_ONE * MAX_ROLL, MIN_ROLL, MAX_ROLL);
+    const float roll_ref_limit =
+        (CHASSIS.mode == CHASSIS_POS_DEBUG && POS_DEBUG_ROLL_ENABLE)
+            ? POS_DEBUG_ROLL_REF_MAX
+            : MAX_ROLL;
+    CHASSIS.ref.body.roll = fp32_constrain(
+        -rc_roll * RC_TO_ONE * roll_ref_limit,
+        -roll_ref_limit,
+        roll_ref_limit);
     last_mode = CHASSIS.mode;
 }
 
@@ -1064,6 +1144,11 @@ static void LocomotionController(void);
 static void LegTorqueController(void);
 static float LegFeedForward(float theta);
 static void CalcLQR(float k[2][6], float x[6], float t[2]);
+static float GetPosDebugThetaReference(float leg_length);
+static void LegSplitController(void);
+static void YawController(void);
+static void RollController(void);
+
 
 static void ConsoleZeroForce(void);
 static void ConsoleCalibrate(void);
@@ -1080,6 +1165,10 @@ static void ConsoleStandUp(void);
 void ChassisConsole(void)
 {
     memset(&CHASSIS.cmd, 0, sizeof(CHASSIS.cmd));//每个控制周期清零所有 cmd，防止非活跃字段残留垃圾值
+    if (CHASSIS.mode != CHASSIS_POS_DEBUG) {
+        PosDebugRollPidReset(&pos_debug_roll_pid);
+        PID_clear(&CHASSIS.pid.roll_angle);
+    }
     switch (CHASSIS.mode) {
         case CHASSIS_CALIBRATE: {
             ConsoleCalibrate();
@@ -1131,12 +1220,61 @@ void ChassisConsole(void)
 /**
  * @brief      运动控制器
  */
+static float LinearInterpolateClamped(
+    float x, float x0, float y0, float x1, float y1)
+{
+    if (x <= x0) {
+        return y0;
+    }
+    if (x >= x1) {
+        return y1;
+    }
+
+    return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+}
+
+/**
+ * @brief 根据平均腿长对 POS_DEBUG 的 theta 平衡点做分段线性插值
+ * @note  返回 theta_ref（正值），控制误差为 theta_fdb - theta_ref。
+ */
+static float GetPosDebugThetaReference(float leg_length)
+{
+    if (leg_length < POS_DEBUG_THETA_REF_L0_1) {
+        return LinearInterpolateClamped(
+            leg_length,
+            POS_DEBUG_THETA_REF_L0_0, POS_DEBUG_THETA_REF_VALUE_0,
+            POS_DEBUG_THETA_REF_L0_1, POS_DEBUG_THETA_REF_VALUE_1);
+    }
+
+    if (leg_length < POS_DEBUG_THETA_REF_L0_2) {
+        return LinearInterpolateClamped(
+            leg_length,
+            POS_DEBUG_THETA_REF_L0_1, POS_DEBUG_THETA_REF_VALUE_1,
+            POS_DEBUG_THETA_REF_L0_2, POS_DEBUG_THETA_REF_VALUE_2);
+    }
+
+    return LinearInterpolateClamped(
+        leg_length,
+        POS_DEBUG_THETA_REF_L0_2, POS_DEBUG_THETA_REF_VALUE_2,
+        POS_DEBUG_THETA_REF_L0_3, POS_DEBUG_THETA_REF_VALUE_3);
+}
+
 static void LocomotionController(void)
 {
     // 计算LQR增益=============================================
     float k[2][6];
     float x[6];
     float T_Tp[2];
+    const float l0_avg =
+        0.5f * (CHASSIS.fdb.leg[0].rod.L0 + CHASSIS.fdb.leg[1].rod.L0);
+    const float theta_ref =
+        (CHASSIS.mode == CHASSIS_POS_DEBUG)
+            ? GetPosDebugThetaReference(l0_avg)
+            : -X0_OFFSET;
+
+    CHASSIS.ref.leg_state[0].theta = theta_ref;
+    CHASSIS.ref.leg_state[1].theta = theta_ref;
+
     bool is_take_off = CHASSIS.fdb.leg[0].is_take_off || CHASSIS.fdb.leg[1].is_take_off;
 #if LIFTED_UP
     is_take_off = true;
@@ -1144,57 +1282,18 @@ static void LocomotionController(void)
     // if (CHASSIS.step == JUMP_STEP_RECOVERY) {
     //     is_take_off = true;
     // }
-
-    if (CHASSIS.mode == CHASSIS_POS_DEBUG) {
-        const float l0_avg =
-            0.5f * (CHASSIS.fdb.leg[0].rod.L0 + CHASSIS.fdb.leg[1].rod.L0);
-        const float theta_avg =
-            0.5f * (CHASSIS.fdb.leg_state[0].theta + CHASSIS.fdb.leg_state[1].theta);
-        const float theta_dot_avg = 0.5f *
-                                    (CHASSIS.fdb.leg_state[0].theta_dot +
-                                     CHASSIS.fdb.leg_state[1].theta_dot);
-        const float theta_ref_avg =
-            0.5f * (CHASSIS.ref.leg_state[0].theta + CHASSIS.ref.leg_state[1].theta);
-        const float theta_dot_ref_avg =
-            0.5f * (CHASSIS.ref.leg_state[0].theta_dot +
-                    CHASSIS.ref.leg_state[1].theta_dot);
-
-        GetK(l0_avg, k, is_take_off);
-
-        // POS_DEBUG 只启用 theta、theta_dot 两个状态，其他四个状态明确置零。
-        x[0] = X0_OFFSET + theta_avg - theta_ref_avg;
-        x[1] = theta_dot_avg - theta_dot_ref_avg;
-        x[2] = 0.0f;
-        x[3] = 0.0f;
-        x[4] = 0.0f;
-        x[5] = 0.0f;
-
-        CalcLQR(k, x, T_Tp);
-
-        const float leg_tp = fp32_constrain(
-            POS_DEBUG_LEG_TP_DIRECTION * POS_DEBUG_LEG_ANGLE_GAIN_SCALE * T_Tp[1],
-            -POS_DEBUG_MAX_LEG_TP, POS_DEBUG_MAX_LEG_TP);
-
-        for (uint8_t i = 0; i < 2; i++) {
-            // 两状态调试阶段 LQR 不控制驱动轮，轮子由 ConsolePosDebug 的零速 PID 抱死。
-            CHASSIS.cmd.leg[i].wheel.T_theta = 0.0f;
-            CHASSIS.cmd.leg[i].wheel.T_x = 0.0f;
-            CHASSIS.cmd.leg[i].wheel.T_phi = 0.0f;
-            CHASSIS.cmd.leg[i].wheel.T = 0.0f;
-            CHASSIS.cmd.leg[i].rod.Tp = leg_tp;
-        }
-        return;
-    }
-
     for (uint8_t i = 0; i < 2; i++) {
-        float l0_avg = 0.5f * (CHASSIS.fdb.leg[0].rod.L0 + CHASSIS.fdb.leg[1].rod.L0);
+                const float tp_direction =
+            (i == 0) ? POS_DEBUG_LEFT_LEG_TP_DIRECTION
+                     : POS_DEBUG_RIGHT_LEG_TP_DIRECTION;
+        // float l0_avg = 0.5f * (CHASSIS.fdb.leg[0].rod.L0 + CHASSIS.fdb.leg[1].rod.L0);
 
-        float theta_avg = 0.5f * (CHASSIS.fdb.leg_state[0].theta + CHASSIS.fdb.leg_state[1].theta);
+        // float theta_avg = 0.5f * (CHASSIS.fdb.leg_state[0].theta + CHASSIS.fdb.leg_state[1].theta);
 
-        float theta_dot_avg =0.5f * (CHASSIS.fdb.leg_state[0].theta_dot + CHASSIS.fdb.leg_state[1].theta_dot);
+        // float theta_dot_avg =0.5f * (CHASSIS.fdb.leg_state[0].theta_dot + CHASSIS.fdb.leg_state[1].theta_dot);
 
-        //GetK(CHASSIS.fdb.leg[i].rod.L0, k, is_take_off);
-        GetK(l0_avg, k, is_take_off);
+        GetK(CHASSIS.fdb.leg[i].rod.L0, k, is_take_off);
+        //GetK(l0_avg, k, is_take_off);
 
         // clang-format off
         //x[0] = X0_OFFSET + (theta_avg     - CHASSIS.ref.leg_state[i].theta);
@@ -1207,12 +1306,16 @@ static void LocomotionController(void)
         //x[3] = X3_OFFSET + (CHASSIS.fdb.leg_state[i].x_dot     - CHASSIS.ref.leg_state[i].x_dot);
         //x[4] = X4_OFFSET + (CHASSIS.fdb.leg_state[i].phi       - CHASSIS.ref.leg_state[i].phi);
         //x[5] = X5_OFFSET + (CHASSIS.fdb.leg_state[i].phi_dot   - CHASSIS.ref.leg_state[i].phi_dot);
-        x[0] = X0_OFFSET + theta_avg;
-        x[1] = theta_dot_avg;
-        x[2] = CHASSIS.fdb.leg_state[i].x;
-        x[3] = CHASSIS.fdb.leg_state[i].x_dot;
+        // x[0] = X0_OFFSET + theta_avg;
+        // x[1] = theta_dot_avg;
+        x[0] = CHASSIS.fdb.leg_state[i].theta - CHASSIS.ref.leg_state[i].theta;
+        x[1] = X1_OFFSET + CHASSIS.fdb.leg_state[i].theta_dot;
+        x[2] = X2_OFFSET +
+            (CHASSIS.fdb.leg_state[i].x - CHASSIS.ref.leg_state[i].x);
+        x[3] = X3_OFFSET +
+            (CHASSIS.fdb.leg_state[i].x_dot - CHASSIS.ref.leg_state[i].x_dot);
         x[4] = X4_OFFSET + CHASSIS.fdb.leg_state[i].phi;
-        x[5] = CHASSIS.fdb.leg_state[i].phi_dot;
+        x[5] = X5_OFFSET + CHASSIS.fdb.leg_state[i].phi_dot;
         // clang-format on
         CalcLQR(k, x, T_Tp);
 
@@ -1225,25 +1328,79 @@ static void LocomotionController(void)
         CHASSIS.cmd.leg[i].wheel.T_phi   = k[0][4] * x[4] + k[0][5] * x[5];
 
         CHASSIS.cmd.leg[i].wheel.T = CHASSIS.cmd.leg[i].wheel.T_theta + CHASSIS.cmd.leg[i].wheel.T_x + CHASSIS.cmd.leg[i].wheel.T_phi;
+
+                // T_Tp[0] 是 LQR 驱动轮输出
+        CHASSIS.cmd.leg[i].wheel.T = fp32_constrain(
+            POS_DEBUG_WHEEL_LQR_GAIN_SCALE * T_Tp[0],
+            -POS_DEBUG_MAX_WHEEL_TORQUE,
+            POS_DEBUG_MAX_WHEEL_TORQUE);
+
+        // T_Tp[1] 使用完整六状态 LQR，经 VMC 控制关节电机。
+        CHASSIS.cmd.leg[i].rod.Tp = fp32_constrain(tp_direction *POS_DEBUG_LEG_ANGLE_GAIN_SCALE *T_Tp[1],-POS_DEBUG_MAX_LEG_TP,POS_DEBUG_MAX_LEG_TP);
     }
 
-        // ROLL角控制=============================================
-        // 计算腿长差值
-        //float Ld0 = CHASSIS.fdb.leg[0].rod.L0 - CHASSIS.fdb.leg[1].rod.L0;
-        //float L_diff = CalcLegLengthDiff(Ld0, CHASSIS.fdb.body.roll, CHASSIS.ref.body.roll);
+}
 
-    //     // PID补偿稳态误差
-    //     float delta_L0 = 0.0f;
+/**
+ * @brief POS_DEBUG Roll 外环：机体横滚角 -> 左右腿长目标总差
+ *
+ * 原始 Euler Roll 在水平姿态附近为 +/-pi，因此只在控制器内部减去安装零点并
+ * wrap 到 [-pi,pi]；不能改写原始姿态量，否则会改变惯导坐标变换的含义。
+ */
+static void RollController(void)
+{
+#if POS_DEBUG_ROLL_ENABLE
+    const bool is_take_off =
+        CHASSIS.fdb.leg[0].is_take_off || CHASSIS.fdb.leg[1].is_take_off;
+    const float dt = CHASSIS.duration * MS_TO_S;
+    const float roll_feedback = PosDebugRollFeedback(
+        CHASSIS.fdb.body.roll,
+        POS_DEBUG_ROLL_ZERO_RAD,
+        POS_DEBUG_ROLL_ANGLE_DIRECTION);
+    const float roll_rate =
+        POS_DEBUG_ROLL_RATE_DIRECTION * CHASSIS.fdb.body.roll_dot;
 
-    //     // 维持腿长在范围内
-    //     CoordinateLegLength(&CHASSIS.ref.rod_L0[0], &CHASSIS.ref.rod_L0[1], L_diff, delta_L0);
+    if (CHASSIS.mode != CHASSIS_POS_DEBUG || is_take_off ||
+        !isfinite(roll_feedback) || !isfinite(roll_rate) ||
+        dt <= 0.0f || dt > POS_DEBUG_ROLL_CONTROL_DT_MAX_S) {
+        PosDebugRollPidReset(&pos_debug_roll_pid);
+        PID_clear(&CHASSIS.pid.roll_angle);
+        return;
+    }
 
-    //     // 转向控制================================================
-    //     if (!is_take_off) {
-    //         PID_calc(&CHASSIS.pid.yaw_velocity, CHASSIS.fdb.body.yaw_dot, CHASSIS.ref.speed_vector.wz);
-    //         CHASSIS.cmd.leg[0].wheel.T += CHASSIS.pid.yaw_velocity.out;
-    //         CHASSIS.cmd.leg[1].wheel.T -= CHASSIS.pid.yaw_velocity.out;
-    //     }
+    const float leg_length_diff = PosDebugRollPidStep(
+        &pos_debug_roll_pid,
+        roll_feedback,
+        CHASSIS.ref.body.roll,
+        roll_rate,
+        dt,
+        KP_CHASSIS_ROLL_ANGLE,
+        KI_CHASSIS_ROLL_ANGLE,
+        KD_CHASSIS_ROLL_ANGLE,
+        MAX_IOUT_CHASSIS_ROLL_ANGLE,
+        MAX_OUT_CHASSIS_ROLL_ANGLE);
+
+    // 同步到原 PID 结构，供 VOFA 继续观察 set/fdb/P/I/D/out。
+    CHASSIS.pid.roll_angle.set = CHASSIS.ref.body.roll;
+    CHASSIS.pid.roll_angle.fdb = roll_feedback;
+    CHASSIS.pid.roll_angle.error[2] = CHASSIS.pid.roll_angle.error[1];
+    CHASSIS.pid.roll_angle.error[1] = CHASSIS.pid.roll_angle.error[0];
+    CHASSIS.pid.roll_angle.error[0] = CHASSIS.ref.body.roll - roll_feedback;
+    CHASSIS.pid.roll_angle.Pout = pos_debug_roll_pid.p_out;
+    CHASSIS.pid.roll_angle.Iout = pos_debug_roll_pid.i_out;
+    CHASSIS.pid.roll_angle.Dout = pos_debug_roll_pid.d_out;
+    CHASSIS.pid.roll_angle.out = leg_length_diff;
+
+    // leg_length_diff 是完整的 L-R 目标差；左右腿各分配一半。
+    CoordinateLegLength(
+        &CHASSIS.ref.rod_L0[0],
+        &CHASSIS.ref.rod_L0[1],
+        leg_length_diff,
+        0.0f);
+#else
+    PosDebugRollPidReset(&pos_debug_roll_pid);
+    PID_clear(&CHASSIS.pid.roll_angle);
+#endif
 }
 
 /**
@@ -1258,11 +1415,19 @@ static void LegTorqueController(void)
     //     fp32_constrain(CHASSIS.fdb.body.roll_dot * ROLL_VEL_LIMIT_FACTOR, -0.2, 0.2);
 
     if (CHASSIS.mode == CHASSIS_POS_DEBUG) {
-        // 调试模式只保留腿长 PID，不加重力前馈；LocomotionController 已给出 Tp。
+        // POS_DEBUG：腿长 PID 叠加渐进式重力前馈；LocomotionController 已给出 Tp。
         for (uint8_t i = 0; i < 2; i++) {
-            CHASSIS.cmd.leg[i].rod.F = POS_DEBUG_LEG_FORCE_DIRECTION * PID_calc(
+            F_ff = POS_DEBUG_GRAVITY_FF_RATIO *
+                LegFeedForward(CHASSIS.fdb.leg_state[i].theta);
+            F_compensate = POS_DEBUG_LEG_FORCE_DIRECTION * PID_calc(
                 &CHASSIS.pid.pos_debug_leg_length_force[i], CHASSIS.fdb.leg[i].rod.L0,
                 CHASSIS.ref.rod_L0[i]);
+
+            // 前馈与 PID 共用原有 40 N 安全范围，避免前馈叠加后突破原力控上限。
+            CHASSIS.cmd.leg[i].rod.F = fp32_constrain(
+                F_ff + F_compensate,
+                -MAX_OUT_POS_DEBUG_LEG_LENGTH_FORCE,
+                MAX_OUT_POS_DEBUG_LEG_LENGTH_FORCE);
         }
 
         CalcVmc(
@@ -1324,6 +1489,127 @@ static void CalcLQR(float k[2][6], float x[6], float T_Tp[2])
     T_Tp[1] = k[1][0] * x[0] + k[1][1] * x[1] + k[1][2] * x[2] + k[1][3] * x[3] + k[1][4] * x[4] +
               k[1][5] * x[5];
 }
+/**
+ * @brief 左右腿摆角差 PD 抑制
+ *
+ * theta_diff > 0 时，期望左腿 theta 减小、右腿 theta 增大。
+ * 补偿先按统一的 LQR 广义力矩坐标计算，再分别经过左右腿 Tp 极性。
+ */
+static void LegSplitController(void)
+{
+#if POS_DEBUG_LEG_SPLIT_ENABLE
+    const float theta_diff =
+        CHASSIS.fdb.leg_state[0].theta -
+        CHASSIS.fdb.leg_state[1].theta;
+
+    const float theta_dot_diff =
+        CHASSIS.fdb.leg_state[0].theta_dot -
+        CHASSIS.fdb.leg_state[1].theta_dot;
+
+    float split_tp =
+        KP_POS_DEBUG_LEG_SPLIT * theta_diff +
+        KD_POS_DEBUG_LEG_SPLIT * theta_dot_diff;
+
+    split_tp = fp32_constrain(
+        split_tp,
+        -MAX_OUT_POS_DEBUG_LEG_SPLIT,
+        MAX_OUT_POS_DEBUG_LEG_SPLIT);
+
+    split_tp *= POS_DEBUG_LEG_SPLIT_DIRECTION;
+
+    /*
+     * 统一广义力矩坐标下：
+     * 左腿补偿 = -split_tp
+     * 右腿补偿 = +split_tp
+     *
+     * 当前 rod.Tp 已经包含每条腿各自的 Tp 执行极性，
+     * 所以差动补偿也必须分别乘对应的方向参数。
+     */
+    CHASSIS.cmd.leg[0].rod.Tp -=
+        POS_DEBUG_LEFT_LEG_TP_DIRECTION * split_tp;
+
+    CHASSIS.cmd.leg[1].rod.Tp +=
+        POS_DEBUG_RIGHT_LEG_TP_DIRECTION * split_tp;
+
+    // 叠加差动补偿后再次做总 Tp 限幅。
+    CHASSIS.cmd.leg[0].rod.Tp = fp32_constrain(
+        CHASSIS.cmd.leg[0].rod.Tp,
+        -POS_DEBUG_MAX_LEG_TP,
+        POS_DEBUG_MAX_LEG_TP);
+
+    CHASSIS.cmd.leg[1].rod.Tp = fp32_constrain(
+        CHASSIS.cmd.leg[1].rod.Tp,
+        -POS_DEBUG_MAX_LEG_TP,
+        POS_DEBUG_MAX_LEG_TP);
+#endif
+}
+
+/**
+ * @brief POS_DEBUG Yaw 双环控制
+ *
+ * 外环：yaw 角度误差 -> 目标 yaw 角速度
+ * 内环：yaw 角速度误差 -> 左右轮差动力矩
+ */
+static void YawController(void)
+{
+#if POS_DEBUG_YAW_ENABLE
+    float yaw_dot_ref;
+
+#if POS_DEBUG_YAW_ANGLE_LOOP_ENABLE
+    // 必须先把角度误差约束到 [-PI, PI]，避免跨越 ±PI 时绕远路。
+    const float yaw_error = rad_format(
+        CHASSIS.ref.body.yaw -
+        CHASSIS.fdb.body.yaw);
+
+    /*
+     * 本工程 PID_calc(pid, fdb, set)，内部误差为 set - fdb。
+     * 这里已经提前算出了环形角度误差，所以使用 fdb=0、set=yaw_error。
+     */
+    yaw_dot_ref = PID_calc(
+        &CHASSIS.pid.yaw_angle,
+        0.0f,
+        yaw_error);
+    // 目标角度本身在移动：叠加其角速度，避免靠持续角度落后来产生转速。
+    // 这是速度参考前馈，不是直接给车轮加力矩；松杆后仅保留角度纠偏。
+    yaw_dot_ref += POS_DEBUG_YAW_RATE_FF * CHASSIS.ref.speed_vector.wz;
+#else
+    // 调内环阶段：遥控器直接给目标 yaw 角速度。
+    yaw_dot_ref = CHASSIS.ref.speed_vector.wz;
+#endif
+
+    yaw_dot_ref = fp32_constrain(
+        yaw_dot_ref,
+        -MAX_OUT_CHASSIS_YAW_ANGLE,
+        MAX_OUT_CHASSIS_YAW_ANGLE);
+
+    // 角速度内环输出为单侧车轮差动力矩。
+    float yaw_torque = PID_calc(
+        &CHASSIS.pid.yaw_velocity,
+        CHASSIS.fdb.body.yaw_dot,
+        yaw_dot_ref);
+
+    yaw_torque *= POS_DEBUG_YAW_TORQUE_DIRECTION;
+
+    /*
+     * wheel.T 是轮电机极性转换前的统一逻辑力矩：
+     * 同号力矩控制前后运动，异号力矩控制 Yaw。
+     */
+    CHASSIS.cmd.leg[0].wheel.T += yaw_torque;
+    CHASSIS.cmd.leg[1].wheel.T -= yaw_torque;
+
+    // LQR 与 Yaw 叠加后，对最终逻辑轮力矩再次限幅。
+    CHASSIS.cmd.leg[0].wheel.T = fp32_constrain(
+        CHASSIS.cmd.leg[0].wheel.T,
+        -POS_DEBUG_MAX_WHEEL_TORQUE,
+        POS_DEBUG_MAX_WHEEL_TORQUE);
+
+    CHASSIS.cmd.leg[1].wheel.T = fp32_constrain(
+        CHASSIS.cmd.leg[1].wheel.T,
+        -POS_DEBUG_MAX_WHEEL_TORQUE,
+        POS_DEBUG_MAX_WHEEL_TORQUE);
+#endif
+}
+
 
 //* 各个模式下的控制
 
@@ -1408,8 +1694,14 @@ static void ConsoleDebug(void)
 
 static void ConsolePosDebug(void)
 {
-    // 两状态 LQR(theta、theta_dot)输出 Tp；腿长 PID 输出 F；F 与 Tp 经 VMC 映射到关节。
+    // 六状态 LQR 同时输出驱动轮力矩 T 和腿端虚拟力矩 Tp。
+    // 腿长 PID 输出 F；F 与 Tp 经 VMC 映射到关节。
     LocomotionController();
+
+    RollController();      // Roll 角通过左右腿长差控制
+    LegSplitController();  // 劈叉控制
+    YawController();       // Yaw 控制
+
     LegTorqueController();
 
     // 关节极性沿用已经工作的正常模式 VMC 力矩映射。
@@ -1424,16 +1716,23 @@ static void ConsolePosDebug(void)
             POS_DEBUG_MAX_JOINT_TORQUE);
     }
 
-    // 驱动轮不接收 LQR 力矩，使用原始电机速度反馈做目标速度为 0 的抱死 PID。
-    // 这里不乘 W0/W1_DIRECTION：PID 输入和电流输出都采用各电机自身的原始方向。
-    CHASSIS.wheel_motor[0].set.tor = 0.0f;
-    CHASSIS.wheel_motor[1].set.tor = 0.0f;
-    CHASSIS.wheel_motor[0].set.vel = 0.0f;
-    CHASSIS.wheel_motor[1].set.vel = 0.0f;
+    // LQR 坐标系力矩转换到两个驱动轮的实际电机方向。
+    // 整体执行极性由 POS_DEBUG_WHEEL_TORQUE_DIRECTION 配置，保持当前已验证值。
+    CHASSIS.wheel_motor[0].set.tor =
+        POS_DEBUG_WHEEL_TORQUE_DIRECTION *
+        CHASSIS.cmd.leg[0].wheel.T *
+        W0_DIRECTION;
+
+    CHASSIS.wheel_motor[1].set.tor =
+        POS_DEBUG_WHEEL_TORQUE_DIRECTION *
+        CHASSIS.cmd.leg[1].wheel.T *
+        W1_DIRECTION;
+
     CHASSIS.wheel_motor[0].set.value =
-        PID_calc(&CHASSIS.pid.wheel_stop[0], CHASSIS.wheel_motor[0].fdb.vel, 0.0f);
+        WheelTorqueTo3508Cmd(CHASSIS.wheel_motor[0].set.tor);
+
     CHASSIS.wheel_motor[1].set.value =
-        PID_calc(&CHASSIS.pid.wheel_stop[1], CHASSIS.wheel_motor[1].fdb.vel, 0.0f);
+        WheelTorqueTo3508Cmd(CHASSIS.wheel_motor[1].set.tor);
 }
 
 static void ConsoleStandUp(void)
@@ -1492,8 +1791,9 @@ static void SendWheelMotorCmd(void);
  */
 void ChassisSendCmd(void)
 {
-    SendJointMotorCmd();
+
     SendWheelMotorCmd();
+    SendJointMotorCmd();
 }
 
 /**

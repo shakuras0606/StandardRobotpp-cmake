@@ -42,6 +42,7 @@
 #include "detect_task.h"
 #include "robot_param.h"
 #include "communication.h"
+#include "CAN_receive.h"
 
 // 遥控器掉线时间阈值
 #define RC_LOST_TIME 100  // ms

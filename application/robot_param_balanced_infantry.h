@@ -13,7 +13,7 @@
 #define __SELF_BOARD_ID C_BOARD_BALANCE_CHASSIS // 本板ID
 #define __GYRO_BIAS_YAW  0.003096855f           // 陀螺仪零飘，单位rad/s
 
-#define __CONTROL_LINK_RC  CL_RC_DIRECT  // 控制链路选择：RC遥控器
+#define __CONTROL_LINK_RC  CL_RC_DIRECT  // 控制链路选择：遥控器接收机接底盘C板UART3
 #define __CONTROL_LINK_KM  CL_KM_RC      // 控制链路选择：键鼠数据
 
 #define __VIRTUAL_GIMBAL_FROM VG_FROM_CAN // 虚拟云台数据来源（用于云台底盘分离控制）
@@ -34,39 +34,108 @@
 #define CHASSIS_ROLL_CHANNEL   4  // ROLL角的遥控器通道号码
 #define CHASSIS_RC_DEADLINE    20 // 摇杆死区
 
-// POS_DEBUG 腿长增量控制参数
-#define POS_DEBUG_LENGTH_CHANNEL       1      // 腿长增量控制通道
-#define POS_DEBUG_MAX_LENGTH_RATE      (0.05f)  // (m/s) 满杆时腿长目标变化速度
-#define POS_DEBUG_MIN_LEG_LENGTH       (0.12f)  // (m) 架空调试腿长下限
-#define POS_DEBUG_MAX_LEG_LENGTH       (0.39f)  // (m) 架空调试腿长上限
+// POS_DEBUG 遥控前后运动与三档腿长参数
+#define POS_DEBUG_X_CHANNEL            1        // 遥控器 ch[1] 控制前进/后退
+#define POS_DEBUG_X_REF_SPEED_MAX      (1.00f)  // (m/s) 满杆目标速度 0.3
+#define POS_DEBUG_X_REF_ACCEL_MAX      (1.00f)  // (m/s^2) 加减速斜坡；0.5
+#define POS_DEBUG_X_REF_DIRECTION      (1.0f)   // 前后控制极性；方向相反时改为 -1.0f
 #define POS_DEBUG_MAX_JOINT_TORQUE     (3.0f)   // (N*m) 架空调试关节力矩限幅
 #define POS_DEBUG_LEG_FORCE_DIRECTION  (1.0f)   // 正误差对应伸腿；方向反了改为 -1.0f
-#define POS_DEBUG_LEG_LENGTH_REF        (0.20f)  // (m) 摆角调试时的固定腿长
+#define POS_DEBUG_LEG_LENGTH_MID_REF    (0.20f)  // (m) 模式开关中档腿长目标
+#define POS_DEBUG_LEG_LENGTH_UP_REF     (0.35f)  // (m) 模式开关上档腿长目标
+#define POS_DEBUG_LEG_LENGTH_RATE_MAX   (0.20f)  // (m/s) 中档与上档切换时的最大腿长变化速度
+#define POS_DEBUG_GRAVITY_FF_RATIO      (0.30f)  // POS_DEBUG 重力前馈比例；下地初调从 20% 开始
 
-// POS_DEBUG 两状态 LQR 调试参数（theta、theta_dot）
-// 只缩放 LQR 的虚拟髋关节力矩 Tp；驱动轮不使用 LQR 输出，单独由零速 PID 抱死。
-// 1.0f 表示使用完整摆角增益；当前 0.20f 表示输出理论值的 20%，用于安全调试。
-#define POS_DEBUG_LEG_ANGLE_GAIN_SCALE    (0.20f)
+// POS_DEBUG 腿长相关 theta 平衡点。
+// 控制器使用 theta_error = theta_fdb - theta_ref；等价的 X0_OFFSET 为 -theta_ref。
+// 当前采用固定腿长数据的第一轮半量修正：短腿偏置较大，随腿长增加逐渐减小。
+// 后续结合 x、x_dot、phi、phi_dot 和轮力矩分量，再继续收敛下面四组标定值。
+#define POS_DEBUG_THETA_REF_L0_0       (0.15f)
+#define POS_DEBUG_THETA_REF_VALUE_0    (0.085f)
+#define POS_DEBUG_THETA_REF_L0_1       (0.20f)
+#define POS_DEBUG_THETA_REF_VALUE_1    (0.070f)
+#define POS_DEBUG_THETA_REF_L0_2       (0.30f)
+#define POS_DEBUG_THETA_REF_VALUE_2    (0.045f)
+#define POS_DEBUG_THETA_REF_L0_3       (0.38f)
+#define POS_DEBUG_THETA_REF_VALUE_3    (0.025f)
+
+// POS_DEBUG 六状态 LQR 调试参数（theta、theta_dot、x、x_dot、phi、phi_dot）。
+// 缩放腿端虚拟髋关节力矩 Tp；1.0f 表示使用完整六状态增益。
+#define POS_DEBUG_LEG_ANGLE_GAIN_SCALE    (1.00f)
 
 // 虚拟髋关节力矩 Tp 的绝对值上限，单位 N*m。
 // Tp 经 VMC 映射到四个关节电机，用于控制腿部摆角；当前限制为 [-0.50, +0.50] N*m。
 // 该值只负责安全限幅，不是 LQR 增益；过小会导致腿摆角控制力不足，过大可能造成关节冲击。
-#define POS_DEBUG_MAX_LEG_TP              (0.50f)
+#define POS_DEBUG_MAX_LEG_TP              (15.00f)
 
-// Tp 的执行器极性，只改变 LQR 输出到关节电机的最终方向，不改变 theta 等状态量定义。
-// 若腿部摆角受到扰动后越偏越大，可在确认 VMC 和关节映射正确后将 1.0f 改为 -1.0f。
-#define POS_DEBUG_LEG_TP_DIRECTION        (1.0f)
+// 左右腿的 Tp 执行器极性。两侧五连杆为镜像结构，相同 Tp 经 VMC 后产生的摆角方向相反，
+// 因此必须分别设置极性；只改变 LQR 输出到关节电机的最终方向，不改变 theta 状态定义。
+#define POS_DEBUG_LEFT_LEG_TP_DIRECTION   (-1.0f)
+#define POS_DEBUG_RIGHT_LEG_TP_DIRECTION  (-1.0f)
+
+
+// POS_DEBUG 驱动轮 LQR 输出缩放。
+// 当前 1.0f 沿用已经实现基础平衡的实车调试值。
+#define POS_DEBUG_WHEEL_LQR_GAIN_SCALE       (1.00f)
+
+// 单个驱动轮允许的最大 LQR 力矩，单位 N*m。
+#define POS_DEBUG_MAX_WHEEL_TORQUE            (5.00f)
+
+// 驱动轮最终执行极性，只在最终电机赋值处改变方向，不修改状态量定义。
+#define POS_DEBUG_WHEEL_TORQUE_DIRECTION     (1.0f)
+
+
+
+/*================ POS_DEBUG 腿部劈叉抑制 ================*/
+
+// 一键开关：0 关闭，1 开启。
+#define POS_DEBUG_LEG_SPLIT_ENABLE          (1)
+
+// 劈叉抑制输出方向。
+// 如果 theta_left - theta_right 越控越大，只修改这里为 -1.0f。
+#define POS_DEBUG_LEG_SPLIT_DIRECTION       (-1.0f)
+
+// 左右腿摆角差 PD。
+// 输入：theta_left - theta_right、theta_dot_left - theta_dot_right。
+// 输出：差动力矩 Tp_split，单位 N*m。
+#define KP_POS_DEBUG_LEG_SPLIT              (1.80f)  // N*m/rad
+#define KD_POS_DEBUG_LEG_SPLIT              (0.03f)  // N*m/(rad/s)
+
+// 劈叉抑制最大差动力矩。
+// 建议初期不超过 POS_DEBUG_MAX_LEG_TP 的 10% 左右。
+#define MAX_OUT_POS_DEBUG_LEG_SPLIT         (0.30f)  // N*m
+
+
+/*================ POS_DEBUG Yaw 双环控制 ================*/
+
+// Yaw 总开关：0 关闭，1 开启。
+#define POS_DEBUG_YAW_ENABLE                (1)
+
+// 0：遥控器直接控制 yaw 角速度，用于先调内环。
+// 1：遥控器以 add 形式改变 yaw 目标角度，用于最终双环控制。
+#define POS_DEBUG_YAW_ANGLE_LOOP_ENABLE     (1)
+
+// 遥控器满杆时 yaw 目标角度的最大变化速度。
+#define POS_DEBUG_YAW_REF_RATE_MAX          (1.50f)  // rad/s 0.5
+#define POS_DEBUG_YAW_REF_LEAD_MAX          (0.50f)  // rad，目标相对反馈最大超前量，必须小于 PI
+#define POS_DEBUG_YAW_RATE_FF               (1.00f)  // 目标角速度前馈系数；0 关闭，1 完整前馈
+
+// Yaw 差动力矩方向。
+// 正 yaw 误差产生的差动力矩若让 yaw 误差增大，则修改为 -1.0f。
+#define POS_DEBUG_YAW_TORQUE_DIRECTION      (1.0f)
+
+
 
 // deadzone parameters ---------------------
 #define WHEEL_DEADZONE (0.01f)  // (m/s)轮子速度死区
 
 // ratio parameters ---------------------
-#define FF_RATIO               (0.25f)   // 前馈比例系数
+#define FF_RATIO               (0.8f)   // 前馈比例系数
 #define ROLL_VEL_LIMIT_FACTOR  (0.1f)    // roll角速度抑制比例系数
 
 // motor parameters ---------------------
 #define JOINT_CAN (1)
-#define WHEEL_CAN (2)
+#define WHEEL_CAN (1)
 
 #define J0_DIRECTION (1)//-1，下同
 #define J1_DIRECTION (1)
@@ -94,7 +163,7 @@
 #define LEG_L4 (LEG_L1)  // (m)腿4长度
 #define LEG_L5 (0.001f)    // (m)关节间距
 
-#define BODY_MASS            (9.05f)      // (kg)机身重量
+#define BODY_MASS            (18.0f)      // (kg)机身重量
 #define WHEEL_MASS           (0.65f)      // (kg)轮子重量
 #define WHEEL_RADIUS         (0.068f)    // (m)轮子半径
 #define WHEEL_START_TORQUE   (0.3f)      // (Nm)轮子起动力矩
@@ -150,7 +219,7 @@
 #define MAX_SPEED_VECTOR_VY  (3.5f)
 #define MAX_SPEED_VECTOR_WZ  (6.0f)
 
-#define MAX_JOINT_TORQUE      (7.0f)   // (Nm)关节最大扭矩
+#define MAX_JOINT_TORQUE      (15.0f)   // (Nm)关节最大扭矩
 #define MAX_JOINT_TORQUE_JUMP (20.0f)  // (Nm)跳跃时的关节最大扭矩
 #define MAX_VEL_ADD           (1.0f)   // (m/s)速度增量上限
 #define MAX_PITCH_VEL         (0.1f)   // (rad/s)pitch轴速度上限
@@ -193,20 +262,21 @@
 #define MIN_VEL_ADD           (-MAX_VEL_ADD)    // (m/s)速度增量下限
 #define MIN_PITCH_VEL         (-MAX_PITCH_VEL)  // (rad/s)pitch轴速度下限
 
-//PID parameters ---------------------
-//yaw轴跟踪角度环PID参数
-#define KP_CHASSIS_YAW_ANGLE        (2.3f)
-#define KI_CHASSIS_YAW_ANGLE        (1.0f)
-#define KD_CHASSIS_YAW_ANGLE        (0.0f)
-#define MAX_IOUT_CHASSIS_YAW_ANGLE  (0.5f)
-#define MAX_OUT_CHASSIS_YAW_ANGLE   (5.0f)
+// Yaw 角度外环：输出目标角速度 rad/s。
+// 初期只使用 P，避免积分导致目标方向缓慢漂移。
+#define KP_CHASSIS_YAW_ANGLE                (1.50f)
+#define KI_CHASSIS_YAW_ANGLE                (0.00f)
+#define KD_CHASSIS_YAW_ANGLE                (0.00f)
+#define MAX_IOUT_CHASSIS_YAW_ANGLE          (0.00f)
+#define MAX_OUT_CHASSIS_YAW_ANGLE           (1.00f)  // rad/s
 
-//yaw轴跟踪速度环PID参数
-#define KP_CHASSIS_YAW_VELOCITY        (2.2f)
-#define KI_CHASSIS_YAW_VELOCITY        (0.5f)
-#define KD_CHASSIS_YAW_VELOCITY        (0.0f)
-#define MAX_IOUT_CHASSIS_YAW_VELOCITY  (0.5f)
-#define MAX_OUT_CHASSIS_YAW_VELOCITY   (2.0f)
+// Yaw 角速度内环：输出左右轮差动力矩 N*m。
+// 初期只使用 P，先确认极性和响应。
+#define KP_CHASSIS_YAW_VELOCITY             (2.00f)
+#define KI_CHASSIS_YAW_VELOCITY             (0.001f)
+#define KD_CHASSIS_YAW_VELOCITY             (0.00f)
+#define MAX_IOUT_CHASSIS_YAW_VELOCITY       (0.00f)
+#define MAX_OUT_CHASSIS_YAW_VELOCITY        (2.00f)  // N*m
 
 // vel_add PID参数
 #define KP_CHASSIS_VEL_ADD        (0.1f) //0.1
@@ -217,13 +287,23 @@
 
 /*========== Start of locomotion control pid ==========*/
 
-//roll轴跟踪角度环PID参数
-#define KP_CHASSIS_ROLL_ANGLE        (0.3f)
-#define KI_CHASSIS_ROLL_ANGLE        (0.0f)
-#define KD_CHASSIS_ROLL_ANGLE        (0.2f)
-#define MAX_IOUT_CHASSIS_ROLL_ANGLE  (0.0f)
-#define MAX_OUT_CHASSIS_ROLL_ANGLE   (0.1f)
-#define N_CHASSIS_ROLL_ANGLE         (0.1f)
+/* POS_DEBUG Roll -> 左右腿长差控制。
+ * PID 输出定义为 left_L0_ref - right_L0_ref，单位 m。
+ * 首轮实车只开启 P；确认 gyro-X 的方向后再逐步加入 KD。
+ */
+#define POS_DEBUG_ROLL_ENABLE                  (1)
+#define POS_DEBUG_ROLL_ZERO_RAD                (M_PI)
+#define POS_DEBUG_ROLL_ANGLE_DIRECTION         (-1.0f)
+#define POS_DEBUG_ROLL_RATE_DIRECTION          (1.0f)
+#define POS_DEBUG_ROLL_REF_MAX                 (0.080f)  // rad，约 4.6 deg
+#define POS_DEBUG_ROLL_CONTROL_DT_MAX_S        (0.020f)
+
+#define KP_CHASSIS_ROLL_ANGLE                  (1.00f)   // m/rad
+#define KI_CHASSIS_ROLL_ANGLE                  (0.05f)   // m/(rad*s)
+#define KD_CHASSIS_ROLL_ANGLE                  (0.00f)   // m/(rad/s)
+#define MAX_IOUT_CHASSIS_ROLL_ANGLE            (0.00f)   // m
+#define MAX_OUT_CHASSIS_ROLL_ANGLE             (0.020f)  // m，总腿长差限幅
+#define N_CHASSIS_ROLL_ANGLE                   (0.1f)
 
 //roll轴跟踪速度环PID参数
 // #define KP_CHASSIS_ROLL_VELOCITY        (0.6f)
@@ -241,8 +321,8 @@
 #define N_LEG_LENGTH_LENGTH                 (0.1f)
 
 // POS_DEBUG 纯腿长力环 PID 参数，输出为沿杆方向的虚拟力(N)
-#define KP_POS_DEBUG_LEG_LENGTH_FORCE        (150.0f)
-#define KI_POS_DEBUG_LEG_LENGTH_FORCE        (0.1f)
+#define KP_POS_DEBUG_LEG_LENGTH_FORCE        (160.0f)
+#define KI_POS_DEBUG_LEG_LENGTH_FORCE        (0.5f)
 #define KD_POS_DEBUG_LEG_LENGTH_FORCE        (1500.0f)
 #define MAX_IOUT_POS_DEBUG_LEG_LENGTH_FORCE  (10.0f)
 #define MAX_OUT_POS_DEBUG_LEG_LENGTH_FORCE   (40.0f)
@@ -287,7 +367,7 @@
 
 //offest parameters ---------------------
 
-#define X0_OFFSET (0.0f)   // 目标theta偏移量
+#define X0_OFFSET (-0.06f)   // 非 POS_DEBUG 模式沿用的固定 theta 偏置
 #define X1_OFFSET (0.0f)   // 目标theta_dot偏移量
 #define X2_OFFSET (0.0f)   // 目标x偏移量 -0.4
 #define X3_OFFSET (0.0f)   // 目标x_dot偏移量

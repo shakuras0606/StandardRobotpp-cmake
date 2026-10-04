@@ -22,5 +22,7 @@ extern hcan_t hcan2;
 
 extern void can_filter_init(void);
 
-extern void CAN_SendTxMessage(CanCtrlData_s * can_ctrl_data);
+extern uint32_t CAN_TX_FAIL_COUNT;
+
+extern HAL_StatusTypeDef CAN_SendTxMessage(CanCtrlData_s * can_ctrl_data);
 #endif

@@ -1,30 +1,20 @@
 // 开发新功能时可以使用本任务进行功能测试
 
 #include "develop_task.h"
+
 #include "FreeRTOS.h"
 #include "task.h"
-#include "stm32f4xx_hal.h"
-#include "tim.h"
-#include "signal_generator.h"
-#include "remote_control.h"
-#include "usb_debug.h"
-#include "CAN_cmd_dji.h"
-
-const Sbus_t* SBUS;
-const RC_ctrl_t* RC_CTRL;
 
 void develop_task(void const * pvParameters)
 {
-    // 空闲一段时间
-    vTaskDelay(500);
+    (void)pvParameters;
 
-    SBUS = get_sbus_point();
-    RC_CTRL = get_remote_control_point();
+    // 空闲一段时间
+    vTaskDelay(pdMS_TO_TICKS(500));
 
     while (1) {
-        // 临时:向CAN1发送0x200报文,控制两个3508(id 1/2),电流全为0
+        // 在此添加临时功能测试代码
 
-
-        vTaskDelay(1);
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }

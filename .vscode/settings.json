@@ -142,5 +142,6 @@
     "cmake.cmakePath": "C:\\Program Files\\JetBrains\\CLion 2025.3.3\\bin\\cmake\\win\\x64\\bin\\cmake.exe",
     "cmake.configureOnOpen": true,
     "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
-    "cortex-debug.variableUseNaturalFormat": true
+    "cortex-debug.variableUseNaturalFormat": true,
+    "python.analysis.stubPath": "C:\\Users\\cheng\\.kendryte\\k230_canmv_pylance\\75d8052effdf00a3\\typings"
 }
