@@ -23,7 +23,7 @@
   ****************************(C) COPYRIGHT 2024 Polarbear****************************
   
 */
-#include "chassis_balance.h"
+#include "chassis_balance.h" 
 #if (CHASSIS_TYPE == CHASSIS_BALANCE)
 #include "CAN_cmd_dji.h"
 #include "CAN_communication.h"
