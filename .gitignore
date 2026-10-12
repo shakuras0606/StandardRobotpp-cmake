@@ -56,6 +56,8 @@ application/chassis/matlab_balance/slprj/
 
 # IDE / editor caches (keep shared .vscode JSON configuration)
 .idea/
+# AI tool-generated debug skill packs (machine-specific, regenerated per workspace)
+.agents/
 .vscode/ipch/
 .vscode/.browse.VC.db*
 *.swp

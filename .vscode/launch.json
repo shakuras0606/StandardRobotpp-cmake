@@ -1,7 +1,18 @@
 {
     "version": "0.2.0",
     "configurations": [
-        
+        {
+            "name": "Orbit Debug (DAPLink STM32F407)",
+            "type": "orbit",
+            "request": "launch",
+            "device": "STM32F407IG",
+            "probe": "cmsis-dap",
+            "program": "${workspaceFolder}/build/standard_robot.elf",
+            "svdFile": "${workspaceFolder}/debug/STM32F407.svd",
+            "rtos": "FreeRTOS",
+            "runToEntryPoint": "main",
+            "flashBeforeDebug": false
+        },
         {
             "name": "OpenOCD CMSIS-DAP (SWD)",
             "type": "cortex-debug",
